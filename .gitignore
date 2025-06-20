@@ -1,0 +1,63 @@
+# Python bytecode and compiled files
+__pycache__/
+app/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# Virtual Environments
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# Secrets and Configuration
+# Ignore all .env files, which may contain secrets.
+# It's a good practice to have a .env.example file in the repo.
+*.env
+!*.env.example
+
+# Distribution / packaging
+build/
+dist/
+eggs/
+*.egg-info/
+wheels/
+sdist/
+
+# Test & Coverage Reports
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+nosetests.xml
+coverage.xml
+
+# Log files
+*.log
+logs/
+
+# Databases
+*.db
+*.sqlite3
+
+# IDE-specific files
+# Visual Studio Code
+# Ignore user-specific settings and state, but allow sharing
+# of launch configurations and workspace settings.
+.vscode/*
+#!/.vscode/launch.json
+!/.vscode/settings.json
+!/.vscode/extensions.json
+!/.vscode/tasks.json
+
+# PyCharm
+.idea/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+._*

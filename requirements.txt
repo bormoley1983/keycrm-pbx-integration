@@ -1,0 +1,7 @@
+fastapi==0.111.*
+uvicorn[standard]==0.29.*
+aiohttp==3.9.*
+panoramisk>=1.4,<2.0      # async AMI client
+pydantic==2.*
+pydantic-settings==2.*
+#python-dotenv==1.0.*     # only if you like ‘dotenv run …’; not required by code
