@@ -13,19 +13,21 @@ Key features
 """
 
 import asyncio
+import aiohttp
 import logging
 import time
 from contextlib import suppress, asynccontextmanager
 from typing import Dict, Optional
+import urllib.parse
+import html
+import re
 
-import aiohttp
 from fastapi import FastAPI, HTTPException, status
 from panoramisk.manager import Manager
 from pydantic import BaseModel, AnyHttpUrl, Field
-
 from app.settings import settings  # see README or settings.py
 
-import re
+
 def normalize_dst(num: str) -> str:
     """
     Strip leading +38 or 38 from Ukrainian numbers.
@@ -41,13 +43,19 @@ def to_international(num: str) -> str:
     Convert a local Ukrainian number (e.g., 0671234567) to +380671234567.
     If already in international format, return as is.
     """
+    if not num or not isinstance(num, str):
+        raise ValueError("Invalid input: number must be a non-empty string")
+    
+    num = num.strip()
     if num.startswith("+38"):
         return num
     if num.startswith("38"):
         return "+" + num
-    if num.startswith("0") and len(num) == 10:
+    if num.startswith("0") and len(num) == 10 and num.isdigit():
         return "+38" + num
-    return num  # fallback, return as is
+    if len(num) == 9 and num.isdigit():
+        return "+380" + num
+    raise ValueError(f"Unexpected number format: {num}")
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -92,8 +100,7 @@ class CallStore:
         self._data[call_id] = meta
 
     def update(self, call_id: str, **changes) -> None:
-        if call_id in self._data:
-            self._data[call_id].update(changes)
+        self._data.setdefault(call_id, {}).update(changes)
 
     def pop(self, call_id: str) -> Optional[Dict]:
         return self._data.pop(call_id, None)
@@ -121,7 +128,8 @@ lid2id: dict[str, str] = {}
 # ---------------------------------------------------------------------------
 # FastAPI setup
 # ---------------------------------------------------------------------------
-app = FastAPI(title="KeyCRM to FreePBX proxy", version="1.0")
+# This first instantiation is redundant and can be removed.
+# app = FastAPI(title="KeyCRM to FreePBX proxy", version="1.0")
 
 
 @asynccontextmanager
@@ -132,7 +140,7 @@ async def lifespan(app: FastAPI):
         log.info("Service ready")
         yield
     except Exception as e:
-        log.error("Failed to start AMI connection: %s", e)
+        log.exception("Failed to start AMI connection")
         app.state.ami = None
         app.state.listener = None
         raise
@@ -157,13 +165,14 @@ app = FastAPI(title="KeyCRM to FreePBX proxy", version="1.0", lifespan=lifespan)
 @app.post("/calls", response_model=CallResponse)
 async def initiate_call(req: CallRequest):
     dst = normalize_dst(req.destination_number)
-    call_id = f"{int(time.time())}_{req.caller}_{dst}"
+    current_time = time.time()
+    call_id = f"{int(current_time)}_{req.caller}_{dst}"
     meta = {
         "direction": "outgoing",
         "caller": req.caller,
         "destination_number": dst,
         "original_destination_number": req.destination_number,
-        "start_time": time.time(),
+        "start_time": current_time,
         "state": "started",
     }
 
@@ -216,7 +225,7 @@ async def hangup_call(call_id: str):
 
     # 3. hang up *strictly* by Uniqueid
     await app.state.ami.send_action(action)
-    log.info("Hangup action sent: %r for call %s", action, call_id)
+    log.info("Hangup action sent: %r for call %s", urllib.parse.quote(str(action)), urllib.parse.quote(call_id))
     return {"success": True}
     
     
@@ -238,7 +247,7 @@ async def keycrm_hangup(payload: dict):
     KeyCRM sends the same structure when the manager presses 'End call'.
     We look up the last active call for that caller (or use the optional id).
     """
-    log.debug("KeyCRM hangup payload: %r", payload)
+    log.debug("KeyCRM hangup payload: %r", html.escape(str(payload)))
 
     # 1. If KeyCRM wrapped under "call", unwrap it
     data = payload.get("call", payload)
@@ -256,7 +265,7 @@ async def keycrm_hangup(payload: dict):
     if not call_id:
         # If we can't find the call, it might have already completed
         # This is normal behavior - return success instead of 404
-        log.info("KeyCRM hangup request for already completed call: %r", payload)
+        log.info("KeyCRM hangup request for already completed call: %r", html.escape(str(payload)))
         return {"success": True, "message": "Call already completed"}
 
     # 4. Try to hangup the call (it might already be hung up)
@@ -265,7 +274,7 @@ async def keycrm_hangup(payload: dict):
     except HTTPException as e:
         if e.status_code == 404:
             # Call already completed, return success
-            log.info("KeyCRM hangup request for already completed call: %s", call_id)
+            log.info("KeyCRM hangup request for already completed call: %s", html.escape(str(call_id)))
             return {"success": True, "message": "Call already completed"}
         else:
             raise
@@ -276,10 +285,7 @@ async def health():
     return {
         "status": "ok",
         "active_calls": len(calls),
-        "ami_connected": bool(
-            getattr(app.state.ami, "connected", None)
-            or getattr(app.state.ami, "_connected", None)
-        ),
+        "ami_connected": bool(app.state.ami.connected if hasattr(app.state.ami, 'connected') else False),
     }
 
 
@@ -307,24 +313,12 @@ async def connect_ami() -> Manager:
         loop=asyncio.get_running_loop(),
         reconnect_timeout=5,
     )
-    await ami.connect()
+    try:
+        await ami.connect()
+    except Exception as e:
+        log.error(f"Failed to connect to AMI: {e}")
+        raise
     return ami
-
-
-async def originate_via_ami(ami: Manager, call_id: str, caller: str, destination: str):
-    action = {
-        "Action": "Originate",
-        "Channel": f"PJSIP/{caller}",
-        "Exten": destination,
-        "Context": "from-internal",
-        "Priority": "1",
-        "CallerID": f"{caller}",
-        "Variable": f"__KEYCRM_CALL_ID={call_id}",
-        "Async": "true",
-        "Timeout": "30000",
-    }
-    await ami.send_action(action)
-    log.info("Originate queued: %s → %s (%s)", caller, destination, call_id)
 
 
 async def ami_listener(ami: Manager):
@@ -335,141 +329,146 @@ async def ami_listener(ami: Manager):
         aid = evt.get("ActionID")
         uid = evt.get("Uniqueid")
         lid = evt.get("Linkedid") or uid
-        ch  = evt.get("Channel")
+        ch = evt.get("Channel")
         response = evt.get("Response", "Unknown")
-        
-        log.debug("OriginateResponse: ActionID=%s, Uniqueid=%s, Linkedid=%s, Response=%s", aid, uid, lid, response)
-        
+
+        log.debug("OriginateResponse: ActionID=%s, Uniqueid=%s, Linkedid=%s, Response=%s",
+                  html.escape(str(aid)), html.escape(str(uid)), html.escape(str(lid)), html.escape(str(response)))
+
         # Find the matching call by ActionID
         cid = None
         for call_id, meta in id_store.items():
             if meta.get("action_id") == aid:
                 cid = call_id
                 break
-        
+
         if not cid:
-            log.warning("OriginateResponse: No call found for ActionID=%s", aid)
+            log.warning("OriginateResponse: No call found for ActionID=%s", html.escape(str(aid)))
             return
-        
+
         # Check if originate was successful
         if response != "Success":
-            log.warning("OriginateResponse failed for call %s: %s", cid, response)
-            # Mark call as failed and clean up
+            log.warning("OriginateResponse failed for call %s: %s", html.escape(cid), html.escape(str(response)))
             calls.update(cid, state="failed")
             meta = calls.get(cid)
             if meta:
                 await notify_keycrm(cid, **meta, state="failed")
             else:
-                log.warning(f"No call metadata found for failed call {cid}, skipping notify_keycrm.")
-                #return  # Do not proceed further if meta is None
-            # Clean up failed call
+                log.warning("No call metadata found for failed call %s, skipping notify_keycrm.", html.escape(cid))
             calls.pop(cid)
             id_store.pop(cid, None)
             return
-        
+
         # Ensure we have valid identifiers
         if not uid:
-            log.error("OriginateResponse: Missing Uniqueid for call %s", cid)
+            log.error("OriginateResponse: Missing Uniqueid for call %s", html.escape(cid))
             return
-        
+
         # Update the call mapping with Asterisk identifiers
         meta = id_store[cid]
         meta.update(a_uid=uid, linkedid=lid, channel=ch)
-          # Add to reverse lookup maps
+
+        # Add to reverse lookup maps
         uid2id[uid] = cid
-        if lid and lid != uid:  # Only add if linkedid is different from uniqueid
-            lid2id[lid] = cid
-        
-        log.info("Successfully mapped call %s: uid=%s, lid=%s, channel=%s", cid, uid, lid, ch)
+        lid2id[lid] = cid
+
+        log.info("Successfully mapped call %s: uid=%s, lid=%s, channel=%s",
+                 html.escape(cid), html.escape(uid), html.escape(str(lid)), html.escape(str(ch)))
     
     @ami.register_event("DialBegin")
     async def dial_handler(mgr, evt):
-        lid = evt.get("Linkedid") or evt.get("Uniqueid")
-        cid = lid2id.get(lid)
-        
-        log.debug("DialBegin: Linkedid=%s, call_id=%s", lid, cid)
-        
+        lookup_id = evt.get("Linkedid") or evt.get("Uniqueid")
+        cid = lid2id.get(lookup_id) or uid2id.get(lookup_id)
+
+        log.debug("DialBegin: Linkedid=%s, Uniqueid=%s, call_id=%s",
+                  html.escape(str(evt.get("Linkedid"))),
+                  html.escape(str(evt.get("Uniqueid"))),
+                  html.escape(str(cid)))
+
         if cid:
             b_uid = evt.get("DestUniqueid")
             meta = id_store[cid]
             meta.update(b_uid=b_uid)
             uid2id[b_uid] = cid
             calls.update(cid, state="connected")
-            log.debug("Call %s connected: b_uid=%s", cid, b_uid)
+            log.debug("Call %s connected: b_uid=%s", html.escape(cid), html.escape(str(b_uid)))
             meta = calls.get(cid)
             if meta:
                 await notify_keycrm(cid, **meta)
             else:
-                log.warning(f"No call metadata found for connected call {cid}, skipping notify_keycrm.")
-                #return  # Do not proceed further if meta is None
+                log.warning("No call metadata found for connected call %s, skipping notify_keycrm.", cid)
+                return  # Exit early if no metadata is found
     
     @ami.register_event("Hangup")
     async def hang_handler(mgr, evt):
         uid = evt.get("Uniqueid")
         lid = evt.get("Linkedid")
-        
-        # Find call ID by checking both Uniqueid and Linkedid
+
         cid = uid2id.get(uid) or lid2id.get(lid)
         if not cid:
-            log.debug("Hangup event for unknown call: uid=%s, lid=%s", uid, lid)
+            log.debug("Hangup event for unknown call: uid=%s, lid=%s",
+                      html.escape(str(uid)), html.escape(str(lid)))
             return
-        
-        log.debug("Hangup event for call %s: uid=%s, lid=%s", cid, uid, lid)
-        
-        # Get call metadata
+
+        log.debug("Hangup event for call %s: uid=%s, lid=%s",
+                  html.escape(cid), html.escape(str(uid)), html.escape(str(lid)))
+
         call_meta = calls.get(cid)
         id_meta = id_store.get(cid, {})
-        
+
         if not call_meta and not id_meta:
-            log.debug("No metadata found for call %s", cid)
+            log.debug("No metadata found for call %s", html.escape(cid))
             return
-        
-        # Check if this is the first hangup for this call
-        # (calls can have multiple channels that hang up separately)
+
         if cid in calls._data:
-            # This is the first hangup - send completion notification
             meta = calls.pop(cid) or {}
             meta.update(id_meta)
-            
-            # Calculate duration
             start_time = meta.get("start_time", time.time())
             dur = int(time.time() - start_time)
-            
-            # Remove state from meta and add completed state with duration
             meta.pop("state", None)
-            
-            log.info("Call %s completed, duration: %d seconds", cid, dur)
+            log.info("Call %s completed, duration: %d seconds", html.escape(cid), dur)
             if meta:
-                await notify_keycrm(cid, **meta, state="completed", duration=dur)
+                meta["state"] = "completed"
+                meta["duration"] = dur
+                await notify_keycrm(cid, **meta)
             else:
-                log.warning(f"No call metadata found for completed call {cid}, skipping notify_keycrm.")
-                #return  # Do not proceed further if meta is None
-        
-        # Clean up tracking dictionaries for this specific channel
-        if uid and uid in uid2id and uid2id[uid] == cid:
+                log.warning("No call metadata found for completed call %s, skipping notify_keycrm.", html.escape(cid))
+
+        if uid in uid2id and uid2id[uid] == cid:
             del uid2id[uid]
-        if lid and lid in lid2id and lid2id[lid] == cid:
+        if lid in lid2id and lid2id[lid] == cid:
             del lid2id[lid]
-        # Clean up id_store only after all channels are done
-        # Check if there are any remaining references to this call
-        remaining_refs = any(
-            call_id == cid for call_id in list(uid2id.values()) + list(lid2id.values())
-        )
+
+        remaining_refs = any(call_id == cid for call_id in list(uid2id.values()) + list(lid2id.values()))
         if not remaining_refs and cid in id_store:
             del id_store[cid]
-            
-        log.debug("Fully cleaned up call %s from tracking", cid)
+
+        log.debug("Fully cleaned up call %s from tracking", html.escape(cid))
     
     @ami.register_event("Newchannel")
     async def on_new_inbound(mgr, evt):
         if evt.get("Context") != "from-pstn":
             return                        # skip outbound and local channels
 
+        # Heuristic to distinguish real inbound calls from legs of outbound calls.
+        # A real inbound call hits a short, numeric DID (Direct Inward Dialing number).
+        # The second leg of an outbound call often has the full external number or 's' as the 'Exten'.
+        did = evt.get("Exten")
+        if not did or not did.isdigit() or len(did) > 5: # Assuming DIDs are numeric and <= 5 digits
+            log.debug("Skipping Newchannel in 'from-pstn' because Exten '%s' doesn't look like a DID.", html.escape(str(did)))
+            return
+
+        # Also, if we are already tracking this call via its Linkedid (e.g. from an OriginateResponse),
+        # don't create a duplicate call record.
+        lid = evt.get("Linkedid")
+        if lid and lid in lid2id:
+            log.debug("Skipping Newchannel for already tracked Linkedid %s", html.escape(str(lid)))
+            return
+
         uid  = evt.get("Uniqueid")
-        lid  = evt.get("Linkedid") or uid
+        lid  = lid or uid
         cid  = f"in_{uid}"               # own id scheme
         ani  = evt.get("CallerIDNum")
-        did  = evt.get("Exten")          # the DID that was dialled
 
         if cid in id_store:              # duplicate safety
             return
@@ -542,7 +541,7 @@ async def notify_keycrm(call_id: str, **meta):
     
     # Skip calls with invalid/missing data
     if not caller or caller == "<unknown>" or not destination_number or destination_number == "s":
-        log.debug("Skipping KeyCRM notification for invalid call: caller=%s, dest=%s", caller, destination_number)
+        log.debug("Skipping KeyCRM notification for invalid call: caller=%s, dest=%s", html.escape(caller), html.escape(destination_number))
         return
     
     # Map internal states to KeyCRM states
@@ -561,7 +560,7 @@ async def notify_keycrm(call_id: str, **meta):
     if keycrm_state == "completed":
         completed_key = f"{call_id}_completed"
         if completed_key in _completed_calls:
-            log.debug("Skipping duplicate completed notification for call %s", call_id)
+            log.debug("Skipping duplicate completed notification for call %s", html.escape(call_id))
             return
         _completed_calls.add(completed_key)
     
@@ -592,10 +591,10 @@ async def notify_keycrm(call_id: str, **meta):
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
             async with s.post(settings.keycrm_webhook_url, json=payload) as resp:
                 if resp.status >= 300:
-                    log.warning("KeyCRM %s %s", resp.status, await resp.text())
+                    log.warning("KeyCRM %s %s", html.escape(resp.status), html.escape(await resp.text()))
                 else:
                     log.debug("Webhook OK   %s %s", call_id, keycrm_state)
     except asyncio.TimeoutError:
-        log.error("Timeout sending webhook to KeyCRM for call %s", call_id)
+        log.error("Timeout sending webhook to KeyCRM for call %s", html.escape(call_id))
     except Exception as e:
-        log.error("Error sending webhook to KeyCRM for call %s: %s", call_id, e)
+        log.error("Error sending webhook to KeyCRM for call %s: %s", html.escape(call_id), html.escape(e))
